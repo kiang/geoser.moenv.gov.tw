@@ -4,137 +4,172 @@ require __DIR__ . '/../vendor/autoload.php';
 
 use GuzzleHttp\Client;
 
-// ========== STEP 1: CRAWL DATA ==========
-
-$cities = [
-    '南投縣',
-    '嘉義縣',
-    '基隆市',
-    '屏東縣',
-    '彰化縣',
-    '新竹市',
-    '新竹縣',
-    '桃園市',
-    '臺中市',
-    '臺南市',
-    '花蓮縣',
-    '苗栗縣',
-    '雲林縣',
-    '高雄市'
-];
-
 $client = new Client([
-    'timeout' => 30,
+    'timeout' => 60,
     'verify' => false
 ]);
 
-$baseUrl = 'https://services7.arcgis.com/tVmMUEViFfyHBZvj/arcgis/rest/services/%E5%BB%A2%E6%A3%84%E7%89%A9%E6%A3%84%E7%BD%AE%E5%A0%B4%E5%9D%80_20210929/FeatureServer/0/query?f=json&where=%E7%B8%A3%E5%B8%82%20%3D%20N%27{city}%27&returnGeometry=true&spatialRel=esriSpatialRelIntersects&outFields=OBJECTID%2C%E6%A1%88%E4%BB%B6%E7%B7%A8%E8%99%9F%2C%E7%B8%A3%E5%B8%82%2C%E8%A1%8C%E6%94%BF%E5%8D%80%2C%E5%9C%B0%E5%9D%80%2C%E5%9C%B0%E8%99%9F%2C%E5%A0%B4%E5%9D%80%E5%90%8D%E7%A8%B1%2CLon%2CLat%2C%E5%BB%A2%E6%A3%84%E7%89%A9%E7%A8%AE%E9%A1%9E%2C%E6%9C%80%E5%BE%8C%E6%9B%B4%E6%96%B0%E6%97%A5%2C%E5%9C%9F%E6%B0%B4%E5%88%97%E7%AE%A1%E5%A0%B4%2C%E7%8F%BE%E5%A0%B4%E7%8B%80%E6%85%8B&outSR=102100&resultOffset=0&resultRecordCount=2000';
+$rootDir = __DIR__ . '/..';
+$rawDir = "{$rootDir}/raw";
+$tmpDir = "{$rootDir}/tmp";
+$jsonOutputFile = "{$rootDir}/docs/json/points.json";
+$csvOutputFile = "{$rootDir}/docs/csv/points.csv";
 
-$rawDir = __DIR__ . '/../raw';
-
-echo "========== CRAWLING DATA ==========\n\n";
-
-foreach ($cities as $city) {
-    echo "Fetching data for: {$city}\n";
-
-    $cityEncoded = urlencode($city);
-    $url = str_replace('{city}', $cityEncoded, $baseUrl);
-
-    try {
-        $response = $client->request('GET', $url);
-        $body = $response->getBody()->getContents();
-
-        $filename = "{$rawDir}/{$city}.json";
-        file_put_contents($filename, $body);
-
-        echo "Saved to: {$filename}\n";
-    } catch (\Exception $e) {
-        echo "Error fetching {$city}: " . $e->getMessage() . "\n";
-    }
-
-    // Be polite to the server
-    sleep(1);
+// Create tmp directory if it doesn't exist
+if (!is_dir($tmpDir)) {
+    mkdir($tmpDir, 0755, true);
 }
 
-echo "\n========== EXTRACTING TO GEOJSON AND CSV ==========\n\n";
+echo "========== FETCHING DATASET LIST ==========\n\n";
 
-// ========== STEP 2: EXTRACT DATA ==========
+// Fetch the dataset list from MOENV API
+$response = $client->request('POST', 'https://data.moenv.gov.tw/api/frontstage/datastore.search', [
+    'headers' => [
+        'Accept' => 'application/json, text/plain, */*',
+        'Content-Type' => 'application/json'
+    ],
+    'body' => json_encode([
+        'resource_id' => '4bc290c9-93f6-4b47-afde-6fce87c91a4b',
+        'limit' => 100,
+        'offset' => 0
+    ])
+]);
 
-$jsonOutputFile = __DIR__ . '/../docs/json/points.json';
-$csvOutputFile = __DIR__ . '/../docs/csv/points.csv';
+$data = json_decode($response->getBody()->getContents(), true);
 
-// Initialize GeoJSON structure
+if (!isset($data['payload']['records']) || empty($data['payload']['records'])) {
+    die("Error: No records found in API response\n");
+}
+
+// Find the record with the largest _id
+$latestRecord = null;
+$maxId = 0;
+
+foreach ($data['payload']['records'] as $record) {
+    if ($record['_id'] > $maxId) {
+        $maxId = $record['_id'];
+        $latestRecord = $record;
+    }
+}
+
+echo "Latest dataset:\n";
+echo "  ID: {$latestRecord['_id']}\n";
+echo "  Filename: {$latestRecord['filename']}\n";
+echo "  URL: {$latestRecord['url']}\n\n";
+
+echo "========== DOWNLOADING ZIP FILE ==========\n\n";
+
+// Download the zip file
+$zipFile = "{$tmpDir}/data.zip";
+$response = $client->request('GET', $latestRecord['url'], [
+    'sink' => $zipFile
+]);
+
+echo "Downloaded to: {$zipFile}\n\n";
+
+echo "========== EXTRACTING ZIP FILE ==========\n\n";
+
+// Extract the zip file
+$zip = new ZipArchive;
+if ($zip->open($zipFile) === true) {
+    $zip->extractTo($tmpDir);
+    $zip->close();
+    echo "Extracted to: {$tmpDir}\n\n";
+} else {
+    die("Error: Failed to extract zip file\n");
+}
+
+// Find the .shp file (search recursively)
+exec("find {$tmpDir} -name '*.shp' -type f", $shpFiles);
+if (empty($shpFiles)) {
+    die("Error: No .shp file found in extracted files\n");
+}
+
+$shpFile = $shpFiles[0];
+echo "Found shapefile: {$shpFile}\n\n";
+
+echo "========== CONVERTING SHAPEFILE TO GEOJSON ==========\n\n";
+
+// Convert shapefile to GeoJSON using ogr2ogr
+$geojsonTmpFile = "{$tmpDir}/output.geojson";
+exec("ogr2ogr -f GeoJSON -t_srs EPSG:4326 {$geojsonTmpFile} {$shpFile}", $output, $returnCode);
+
+if ($returnCode !== 0) {
+    die("Error: Failed to convert shapefile to GeoJSON\n");
+}
+
+echo "Converted to GeoJSON\n\n";
+
+echo "========== PROCESSING DATA ==========\n\n";
+
+// Read the converted GeoJSON
+$geojsonData = json_decode(file_get_contents($geojsonTmpFile), true);
+
+// Initialize output structures
 $geojson = [
     'type' => 'FeatureCollection',
     'features' => []
 ];
 
-// Array to store all CSV rows
 $csvRows = [];
 $csvHeaders = null;
 
-// Get all JSON files from raw directory
-$jsonFiles = glob($rawDir . '/*.json');
+// Process each feature
+foreach ($geojsonData['features'] as $feature) {
+    $properties = $feature['properties'];
+    $geometry = $feature['geometry'];
 
-echo "Processing " . count($jsonFiles) . " files...\n";
+    // Map field names - use Chinese field names
+    $id = $properties['案件編號'] ?? null;
+    $lon = $properties['Lon'] ?? null;
+    $lat = $properties['Lat'] ?? null;
 
-foreach ($jsonFiles as $file) {
-    $city = basename($file, '.json');
-    echo "Processing: {$city}\n";
-
-    $content = file_get_contents($file);
-    $data = json_decode($content, true);
-
-    if (!isset($data['features'])) {
-        echo "  Warning: No features found in {$city}\n";
-        continue;
+    // Extract for GeoJSON (id from 案件編號, Lon, Lat)
+    if ($lon !== null && $lat !== null && $id !== null) {
+        $geojsonFeature = [
+            'type' => 'Feature',
+            'properties' => [
+                'id' => $id
+            ],
+            'geometry' => [
+                'type' => 'Point',
+                'coordinates' => [
+                    (float)$lon,
+                    (float)$lat
+                ]
+            ]
+        ];
+        $geojson['features'][] = $geojsonFeature;
     }
 
-    foreach ($data['features'] as $feature) {
-        $attributes = $feature['attributes'];
-
-        // Extract for GeoJSON (OBJECTID, Lon, Lat)
-        if (isset($attributes['Lon']) && isset($attributes['Lat']) && isset($attributes['OBJECTID'])) {
-            $geojsonFeature = [
-                'type' => 'Feature',
-                'properties' => [
-                    'OBJECTID' => $attributes['OBJECTID']
-                ],
-                'geometry' => [
-                    'type' => 'Point',
-                    'coordinates' => [
-                        (float)$attributes['Lon'],
-                        (float)$attributes['Lat']
-                    ]
-                ]
-            ];
-            $geojson['features'][] = $geojsonFeature;
-        }
-
-        // Extract for CSV (all attributes except Lon, Lat)
-        $csvRow = [];
-        foreach ($attributes as $key => $value) {
-            if ($key !== 'Lon' && $key !== 'Lat') {
+    // Extract for CSV (all attributes except Lon, Lat)
+    // Map 案件編號 to id for consistency
+    $csvRow = [];
+    foreach ($properties as $key => $value) {
+        if ($key !== 'Lon' && $key !== 'Lat') {
+            if ($key === '案件編號') {
+                $csvRow['id'] = $value;
+            } else {
                 $csvRow[$key] = $value;
             }
         }
-
-        // Set CSV headers from first row
-        if ($csvHeaders === null) {
-            $csvHeaders = array_keys($csvRow);
-        }
-
-        $csvRows[] = $csvRow;
     }
+
+    // Set CSV headers from first row
+    if ($csvHeaders === null) {
+        $csvHeaders = array_keys($csvRow);
+    }
+
+    $csvRows[] = $csvRow;
 }
 
 // Write GeoJSON file
-echo "\nWriting GeoJSON to: {$jsonOutputFile}\n";
+echo "Writing GeoJSON to: {$jsonOutputFile}\n";
 file_put_contents($jsonOutputFile, json_encode($geojson, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
-echo "Total features in GeoJSON: " . count($geojson['features']) . "\n";
+echo "Total features in GeoJSON: " . count($geojson['features']) . "\n\n";
 
 // Write CSV file
-echo "\nWriting CSV to: {$csvOutputFile}\n";
+echo "Writing CSV to: {$csvOutputFile}\n";
 $csvHandle = fopen($csvOutputFile, 'w');
 
 // Write headers
@@ -152,6 +187,26 @@ foreach ($csvRows as $row) {
 }
 
 fclose($csvHandle);
-echo "Total rows in CSV: " . count($csvRows) . "\n";
+echo "Total rows in CSV: " . count($csvRows) . "\n\n";
 
-echo "\nDone!\n";
+echo "========== CLEANING UP ==========\n\n";
+
+// Clean up tmp directory recursively
+function removeDirectory($path) {
+    if (!is_dir($path)) {
+        return unlink($path);
+    }
+    $files = array_diff(scandir($path), ['.', '..']);
+    foreach ($files as $file) {
+        removeDirectory($path . '/' . $file);
+    }
+    return rmdir($path);
+}
+
+$files = glob("{$tmpDir}/*");
+foreach ($files as $file) {
+    removeDirectory($file);
+}
+echo "Cleaned up temporary files\n\n";
+
+echo "Done!\n";
